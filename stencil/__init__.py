@@ -4,6 +4,7 @@ import abc
 from argparse import ArgumentParser
 import sys
 import signal
+import os
 from typing import Optional, Type, Dict, Callable, Any
 from contextlib import contextmanager
 from stencil._managers.bit_manager import BitManager
@@ -151,6 +152,9 @@ class ServiceRunner:
         self.service: Optional[Service] = None
         self.logger = logging.getLogger("ServiceRunner")
         self._shutdown_requested = threading.Event()
+        self._signal_received = threading.Event()
+        self._original_sigint_handler = None
+        self._original_sigterm_handler = None
         self._built_in_commands = {
             's': {'handler': self._stop_service, 'description': 'Stop the service gracefully'},
             'stop': {'handler': self._stop_service, 'description': 'Stop the service gracefully'},
@@ -179,6 +183,11 @@ class ServiceRunner:
             "--log-file",
             type=str,
             help="Path to a file to write logs to"
+        )
+        parser.add_argument(
+            "--no-signal-handling",
+            action="store_true",
+            help="Disable signal handling (useful for debugging in IDEs)"
         )
         
         # Allow service class to add custom arguments
@@ -216,15 +225,61 @@ class ServiceRunner:
             except Exception as e:
                 self.logger.error(f"Failed to setup file logging: {e}")
 
-    def setup_signal_handlers(self):
+    def setup_signal_handlers(self, enable_signal_handling: bool = True):
         """Setup signal handlers for graceful shutdown."""
+        if not enable_signal_handling:
+            self.logger.info("Signal handling disabled")
+            return
+            
+        # Check if we're in a debugger or IDE environment
+        in_debugger = (
+            sys.gettrace() is not None or  # Python debugger active
+            'pydevd' in sys.modules or     # PyCharm debugger
+            'debugpy' in sys.modules or    # VS Code debugger
+            os.environ.get('PYCHARM_HOSTED') or  # PyCharm environment
+            hasattr(sys, 'ps1')            # Interactive Python shell
+        )
+        
+        if in_debugger:
+            self.logger.info("Debugger detected - signal handling may be limited")
+        
         def signal_handler(signum, frame):
-            signal_name = signal.Signals(signum).name
-            self.logger.info(f"Received {signal_name}, initiating graceful shutdown...")
-            self._shutdown_requested.set()
+            try:
+                signal_name = signal.Signals(signum).name
+                self.logger.info(f"Received {signal_name}, initiating graceful shutdown...")
+                print(f"\nReceived {signal_name} - shutting down gracefully...")
+                self._signal_received.set()
+                self._shutdown_requested.set()
+                
+                # For immediate shutdown on second signal
+                if self._signal_received.is_set():
+                    def second_signal_handler(signum, frame):
+                        print(f"\nReceived second {signal_name} - forcing immediate shutdown!")
+                        os._exit(1)
+                    
+                    signal.signal(signum, second_signal_handler)
+                    
+            except Exception as e:
+                print(f"Error in signal handler: {e}")
+                os._exit(1)
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        try:
+            # Store original handlers so we can restore them if needed
+            self._original_sigint_handler = signal.signal(signal.SIGINT, signal_handler)
+            self._original_sigterm_handler = signal.signal(signal.SIGTERM, signal_handler)
+            self.logger.info("Signal handlers installed successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to install signal handlers: {e}")
+
+    def restore_signal_handlers(self):
+        """Restore original signal handlers."""
+        try:
+            if self._original_sigint_handler is not None:
+                signal.signal(signal.SIGINT, self._original_sigint_handler)
+            if self._original_sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, self._original_sigterm_handler)
+        except Exception as e:
+            self.logger.debug(f"Error restoring signal handlers: {e}")
 
     @contextmanager
     def service_context(self):
@@ -248,8 +303,24 @@ class ServiceRunner:
         input_thread = threading.Thread(target=self._monitor_input, daemon=True)
         input_thread.start()
 
-        # Wait for shutdown signal
-        self._shutdown_requested.wait()
+        # Enhanced shutdown waiting with periodic checks
+        try:
+            while not self._shutdown_requested.is_set():
+                # Wait for shutdown with timeout to allow periodic checks
+                if self._shutdown_requested.wait(timeout=0.5):
+                    break
+                    
+                # Check if service is still running
+                if self.service and not self.service.is_running:
+                    self.logger.info("Service stopped unexpectedly")
+                    self._shutdown_requested.set()
+                    break
+                    
+        except KeyboardInterrupt:
+            # This catches Ctrl+C if signal handling fails
+            self.logger.info("Keyboard interrupt detected")
+            self._shutdown_requested.set()
+        
         self.logger.info("Shutdown requested.")
 
     def _show_startup_help(self):
@@ -272,7 +343,8 @@ class ServiceRunner:
                     desc = info['description'] or 'Custom command'
                     print(f"  {cmd:<10} - {desc}")
         
-        print("\nType any command and press Enter, or use Ctrl+C for immediate shutdown")
+        print("\nType any command and press Enter")
+        print("Use Ctrl+C for immediate shutdown (may require two presses)")
         print("="*60 + "\n")
 
     def _show_help(self):
@@ -302,6 +374,7 @@ class ServiceRunner:
             print(f"\nService Status: {status}")
             print(f"Service Class: {self.service.__class__.__name__}")
             print(f"Available Commands: {len(self._get_all_commands())}")
+            print(f"Signal Received: {'Yes' if self._signal_received.is_set() else 'No'}")
         else:
             print("\nService Status: NOT INITIALIZED")
         print()
@@ -322,31 +395,54 @@ class ServiceRunner:
     def _monitor_input(self):
         """Monitor stdin for user commands."""
         try:
-            for line in sys.stdin:
-                command = line.strip().lower()
-                if not command:
-                    continue
-                
-                # Get all available commands
-                all_commands = self._get_all_commands()
-                
-                if command in all_commands:
-                    try:
-                        # Execute the command handler
-                        handler = all_commands[command]['handler']
-                        result = handler()
-                        if result is not None:
-                            print(f"Command result: {result}")
-                    except Exception as e:
-                        print(f"Error executing command '{command}': {e}")
-                        self.logger.error(f"Command execution error: {e}")
-                else:
-                    print(f"Unknown command: '{command}'. Type 'h' for help.")
-                
-                # Check if shutdown was requested
-                if self._shutdown_requested.is_set():
-                    break
+            while not self._shutdown_requested.is_set():
+                try:
+                    # Use a timeout-based approach to check for shutdown
+                    import select
+                    if hasattr(select, 'select'):
+                        # Unix-like systems
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+                        if not ready:
+                            continue
+                            
+                    line = sys.stdin.readline()
+                    if not line:  # EOF
+                        break
+                        
+                    command = line.strip().lower()
+                    if not command:
+                        continue
                     
+                    # Get all available commands
+                    all_commands = self._get_all_commands()
+                    
+                    if command in all_commands:
+                        try:
+                            # Execute the command handler
+                            handler = all_commands[command]['handler']
+                            result = handler()
+                            if result is not None:
+                                print(f"Command result: {result}")
+                        except Exception as e:
+                            print(f"Error executing command '{command}': {e}")
+                            self.logger.error(f"Command execution error: {e}")
+                    else:
+                        print(f"Unknown command: '{command}'. Type 'h' for help.")
+                    
+                    # Check if shutdown was requested
+                    if self._shutdown_requested.is_set():
+                        break
+                        
+                except select.error:
+                    # Handle systems without select (like Windows)
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+                        # Process command as above...
+                    except:
+                        break
+                        
         except EOFError:
             # Handle case where stdin is closed
             pass
@@ -359,7 +455,8 @@ class ServiceRunner:
         args = parser.parse_args()
 
         self.setup_logging(args.log_level, args.log_file)
-        self.setup_signal_handlers()
+        enable_signals = not getattr(args, 'no_signal_handling', False)
+        self.setup_signal_handlers(enable_signals)
 
         try:
             with self.service_context() as service:
@@ -367,10 +464,12 @@ class ServiceRunner:
                 self.wait_for_shutdown()
         except KeyboardInterrupt:
             self.logger.info("Interrupted by user.")
+            print("\nShutdown complete.")
         except Exception as e:
             self.logger.critical(f"Unexpected error: {e}", exc_info=True)
             return 1
         finally:
+            self.restore_signal_handlers()
             self.logger.info("Service runner exiting.")
         
         return 0
